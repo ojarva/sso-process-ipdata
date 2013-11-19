@@ -1,0 +1,5 @@
+syntax: glob
+*.pyc
+*.json
+GeoLite2-City.mmdb
+local_settings.py
