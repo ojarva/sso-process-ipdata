@@ -1,7 +1,6 @@
 import subprocess
 import redis
 import time
-import re
 from config import Config
 import socket
 import geoip2
@@ -13,101 +12,105 @@ from instrumentation import *
 
 socket.setdefaulttimeout(5)
 
-geo = geoip2.database.Reader("GeoLite2-City.mmdb")
 from local_settings import IP_NETWORKS
 
-class IPdbUpdate:
-    def __init__(self):
-        self._db = None
-        self.config = Config()
-        self.redis = redis.Redis(host=self.config.get("redis-hostname"), port=self.config.get("redis-port"), db=self.config.get("redis-db"))
+class ProcessIP:
+    def __init__(self, redis_instance, ip_addr):
+        self.geo = geoip2.database.Reader("GeoLite2-City.mmdb")
+        self.ip_addr = ip_addr
+        self._ip = ipaddr.IPv4Address(self.ip_addr)
+        self.redis = redis_instance
 
-    @timing("ipdb.update.main")
-    def process(self):
-        #lpop is blocking call
-        ip_addr = self.redis.lpop("ip-resolve-queue")
-        while ip_addr:
-            self.fetch(ip_addr)
-            ip_addr = self.redis.lpop("ip-resolve-queue")
-
-    def fetch(self, ip_addr):
+    def fetch(self):
+        """ Fetches all (DNS/geoip/whois) information for the address """
         statsd.incr("ipdb.fetch")
-        self.fetch_dns(ip_addr)
-        self.fetch_geoip(ip_addr)
-        self.fetch_ip_whois(ip_addr)
-        hostname = self.redis.get("ipdb-reverse-for-%s" % ip_addr)
-        if hostname and not self.is_local_address(ip_addr):
+        self.fetch_dns()
+        self.fetch_geoip()
+        self.fetch_ip_whois()
+        hostname = self.redis.get("ipdb-reverse-for-%s" % self.ip_addr)
+        if hostname and not self.is_local_address():
             self.fetch_dns_whois(hostname)
 
-    def fetch_dns(self, ip_addr):
+    def fetch_dns(self):
+        """ Fetch reverse DNS information (hostname) """
         statsd.incr("ipdb.fetch_dns")
         try:
-            hostname = socket.gethostbyaddr(ip_addr)
+            hostname = socket.gethostbyaddr(self.ip_addr)
         except:
             return
-        self.redis.set("ipdb-reverse-for-%s" % ip_addr, hostname[0])
-        self.redis.set("ipdb-reverse-for-%s-timestamp" % ip_addr, time.time())
+        self.redis.set("ipdb-reverse-for-%s" % self.ip_addr, hostname[0])
+        self.redis.set("ipdb-reverse-for-%s-timestamp" % self.ip_addr, time.time())
         try:
             ip_for_hostname = socket.gethostbyname(hostname[0])
         except:
             return
 
-        if ip_for_hostname == ip_addr:
-            self.redis.set("ipdb-reverse-for-%s-valid" % ip_addr, True)
+        if ip_for_hostname == self.ip_addr:
+            self.redis.set("ipdb-reverse-for-%s-valid" % self.ip_addr, True)
         else:
-            self.redis.set("ipdb-reverse-for-%s-valid" % ip_addr, False)
+            self.redis.set("ipdb-reverse-for-%s-valid" % self.ip_addr, False)
 
-    def is_local_address(self, ip_addr):
-        _ip = ipaddr.IPv4Address(ip_addr)
-        status =  _ip.is_link_local or _ip.is_multicast or _ip.is_reserved or _ip.is_private
+    def is_local_address(self):
+        """ Returns True, if the address is reserved/private/local/multicast"""
+        status = (self._ip.is_link_local or 
+                 self._ip.is_multicast or
+                 self._ip.is_reserved or
+                 self._ip.is_private)
         if status:
             statsd.incr("ipdb.local_address")
         else:
             statsd.incr("ipdb.real_address")
         return status
 
-    def is_futurice_net(self, ip_addr):
-        _ip = ipaddr.IPv4Address(ip_addr)
+    def is_private_net(self):
+        """ Returns True if specified in private networks, imported from
+            local_settings """
         for (network, country, city, description) in IP_NETWORKS:
-            if (isinstance(network, ipaddr.IPv4Address) and _ip is network) or (isinstance(network, ipaddr.IPv4Network) and _ip in network):
-                self.redis.set("ipdb-city-for-ip-%s" % ip_addr, city)
-                self.redis.set("ipdb-country-for-ip-%s" % ip_addr, country)
-                self.redis.set("ipdb-description-for-ip-%s" % ip_addr, description)
-                self.redis.set("ipdb-at-office-ip-%s" % ip_addr, True)
+            if ((isinstance(network, ipaddr.IPv4Address) and 
+                self._ip is network) or 
+               (isinstance(network, ipaddr.IPv4Network) and 
+                self._ip in network)):
+                self.redis.set("ipdb-city-for-ip-%s" % self.ip_addr, city)
+                self.redis.set("ipdb-country-for-ip-%s" % self.ip_addr, country)
+                self.redis.set("ipdb-description-for-ip-%s" % self.ip_addr, description)
+                self.redis.set("ipdb-at-office-ip-%s" % self.ip_addr, True)
                 statsd.incr("ipdb.futurice_address")
                 return True
         statsd.incr("ipdb.external_address")
         return False
 
     @timing("ipdb.fetch_geoip")
-    def fetch_geoip(self, ip_addr):
-        if self.is_local_address(ip_addr):
+    def fetch_geoip(self):
+        """ Fetch geoip information, if not local address """
+        if self.is_local_address():
             return
         statsd.incr("ipdb.fetch_geoip")
-        city = geo.city(ip_addr)
-        self.redis.set("ipdb-country-for-ip-%s" % ip_addr,  city.country.iso_code)
+        city = self.geo.city(self.ip_addr)
+        self.redis.set("ipdb-country-for-ip-%s" % self.ip_addr,  city.country.iso_code)
         if city.city.name:
             statsd.incr("ipdb.fetch_geoip.city")
-            self.redis.set("ipdb-city-for-ip-%s" % ip_addr,  city.city.name)
+            self.redis.set("ipdb-city-for-ip-%s" % self.ip_addr,  city.city.name)
 
-    def fetch_ip_whois(self, ip_addr):
-        if self.is_futurice_net(ip_addr):
+    def fetch_ip_whois(self):
+        """ Fetch whois information for IP, if not available from redis """
+        if self.is_private_net():
             return
-        if self.is_local_address(ip_addr):
+        if self.is_local_address():
             return
-        if self.redis.exists("ipdb-whois-for-ip-%s" % ip_addr):
+        if self.redis.exists("ipdb-whois-for-ip-%s" % self.ip_addr):
             return
-        self._fetch_ip_whois(ip_addr)
+        self._fetch_ip_whois()
 
     @timing("ipdb.fetch_ip_whois")
-    def _fetch_ip_whois(self, ip_addr):
+    def _fetch_ip_whois(self):
         statsd.incr("ipdb.fetch_ip_whois")
-        proc = subprocess.Popen(["whois", ip_addr], stdout=subprocess.PIPE)
+        proc = subprocess.Popen(["whois", self.ip_addr], stdout=subprocess.PIPE)
         (data, _) = proc.communicate()
-        self.redis.set("ipdb-whois-for-ip-%s" % ip_addr, data)
-        self.redis.set("ipdb-whois-for-ip-%s-timestamp" % ip_addr, time.time())
+        self.redis.set("ipdb-whois-for-ip-%s" % self.ip_addr, data)
+        self.redis.set("ipdb-whois-for-ip-%s-timestamp" % self.ip_addr, time.time())
 
     def fetch_dns_whois(self, hostname):
+        """ Fetch whois information for domain, if not available from redis"""
         hostname = hostname.split(".")
         hostname = ".".join(len(hostname[-2]) < 4 and hostname[-3:] or hostname[-2:])
         if self.redis.exists("ipdb-whois-for-domain-%s" % hostname):
@@ -123,21 +126,27 @@ class IPdbUpdate:
         self.redis.set("ipdb-whois-for-domain-%s-timestamp" % hostname, time.time())
 
 
-def is_valid_hostname(hostname):
-    if len(hostname) > 255:
-        return False
-    allowed = re.compile("(?!-)[A-Z\d-]{1,63}(?<!-)$", re.IGNORECASE)
-    return all(allowed.match(x) for x in hostname.split("."))
-
+@timing("ipdb.update.main")
+def process(redis_instance):
+    """ Process queue indefinitely """
+    #lpop is blocking call
+    ip_addr = redis_instance.lpop("ip-resolve-queue")
+    while ip_addr:
+        ipdata = ProcessIP(ip_addr, redis_instance)
+        ipdata.fetch()
+        ip_addr = redis_instance.lpop("ip-resolve-queue")
 
 def main(args):
-    ipdb = IPdbUpdate()
-    if len(args) > 1:
+    """ If the first item in args list is "daemon", loop over process()."""
+    config = Config()
+    redis_instance = redis.Redis(host=config.get("redis-hostname"), 
+            port=config.get("redis-port"), db=config.get("redis-db"))
+    if isinstance(args, list) and len(args) > 1:
         if args[1] == "daemon":
             while True:
-                ipdb.process()
+                process(redis_instance)
                 time.sleep(5)
-    ipdb.process()
+    process(redis_instance)
 
 if __name__ == '__main__':
     main(sys.argv)
