@@ -15,7 +15,7 @@ socket.setdefaulttimeout(5)
 from local_settings import IP_NETWORKS
 
 class ProcessIP:
-    def __init__(self, redis_instance, ip_addr):
+    def __init__(self, ip_addr, redis_instance):
         self.geo = geoip2.database.Reader("GeoLite2-City.mmdb")
         self.ip_addr = ip_addr
         self._ip = ipaddr.IPv4Address(self.ip_addr)
