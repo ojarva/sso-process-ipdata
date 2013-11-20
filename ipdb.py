@@ -18,7 +18,12 @@ class ProcessIP:
     def __init__(self, ip_addr, redis_instance):
         self.geo = geoip2.database.Reader("GeoLite2-City.mmdb")
         self.ip_addr = ip_addr
-        self._ip = ipaddr.IPv4Address(self.ip_addr)
+        self.ipv6 = False
+        try:
+            self._ip = ipaddr.IPv4Address(self.ip_addr)
+        except ipaddr.AddressValueError:
+            self._ip = ipaddr.IPv6Address(self.ip_addr)
+            self.ipv6 = True
         self.redis = redis_instance
 
     def fetch(self):
